@@ -5,12 +5,26 @@
 #include <winsock2.h>
 #include <windows.h>
 #include <string>
-#include <sstream>
 #include <ws2tcpip.h>
 
 #pragma comment(lib, "ws2_32.lib")
 
 using namespace std;
+const int MAX_CLIENTS = 10;  // Максимальное количество подключенных клиентов
+int currentClients = 0;       // Текущее количество клиентов
+CRITICAL_SECTION cs;          // Критическая секция
+
+struct BinaryRequest {
+    char surname[64];
+    double height;
+    double weight;
+};
+
+struct BinaryResponse {
+    char surname[64];
+    char result[84];
+    int status;  // 0 - норма, 1 - выше, 2 - ниже
+};
 
 string checkWeight(double height, double weight) {
     double idealWeight = height - 110;
@@ -26,53 +40,89 @@ string checkWeight(double height, double weight) {
     }
 }
 
-void handleClient(SOCKET clientSocket) {//добавить реализацию для бинарников(на основе 2-х указателей в буфере потом)
-    char buffer[1024];
+void handleClient(LPVOID lpParam) {
+    SOCKET clientSocket = (SOCKET)lpParam;
+    BinaryRequest request;
+    BinaryResponse response;
+
+    // Устанавливаем таймауты для сокета
+    int timeout = 30000; // 30 секунд
+    setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
+    setsockopt(clientSocket, SOL_SOCKET, SO_SNDTIMEO, (char*)&timeout, sizeof(timeout));
+
+    cout << "Клиент работает в бинарном режиме" << endl;
 
     try {
         while (true) {
-            // Получаем данные от клиента
-            memset(buffer, 0, sizeof(buffer));
-            int bytesReceived = recv(clientSocket, buffer, sizeof(buffer), 0);//настроить таймауты(3 шт)
+            memset(&request, 0, sizeof(request));
 
-            if (bytesReceived <= 0) {
+            // Таймаут 1: Ожидание данных
+            int bytesReceived = recv(clientSocket, (char*)&request, sizeof(request), 0);
+
+            if (bytesReceived == SOCKET_ERROR) {
+                int error = WSAGetLastError();
+                if (error == WSAETIMEDOUT) {
+                    cout << "Таймаут ожидания данных" << endl;
+                }
+                else {
+                    cout << "Ошибка приема данных: " << error << endl;
+                }
+                break;
+            }
+
+            if (bytesReceived == 0) {
                 cout << "Клиент отключился" << endl;
                 break;
             }
 
-            string data(buffer);
-            cout << "Получено: " << data << endl;
-
-            string surname;
-            double height, weight;
-            istringstream iss(data);
-
-            if (iss >> surname >> height >> weight) {
-                string result = checkWeight(height, weight);
-                string response = surname + ": " + result + "\n";
-
-                // Отправляем результат обратно клиенту
-                send(clientSocket, response.c_str(), response.length(), 0);
-                cout << "Отправлено: " << response;
+            // Проверка на неполные данные (защита от слишком больших/маленьких данных)
+            if (bytesReceived != sizeof(request)) {
+                cout << "Получены данные некорректного размера: " << bytesReceived << " байт" << endl;
+                continue;
             }
-            else {
-                string error = "Ошибка формата! Введите: Фамилия рост вес\n";
-                send(clientSocket, error.c_str(), error.length(), 0);
+
+            request.surname[49] = '\0'; // Гарантия завершения строки
+            cout << "Получено: " << request.surname
+                << ", рост: " << request.height << ", вес: " << request.weight << endl;
+
+            // Формируем ответ
+            string result = checkWeight(request.height, request.weight);
+
+            memset(&response, 0, sizeof(response));
+            strncpy_s(response.surname, request.surname, 49);
+            strncpy_s(response.result, result.c_str(), 19);
+            response.status = (result.find("Normal") != string::npos) ? 0 :
+                (result.find("uppered") != string::npos) ? 1 : 2;
+
+            // Таймаут 2: Отправка ответа
+            if (send(clientSocket, (char*)&response, sizeof(response), 0) == SOCKET_ERROR) {
+                cout << "Ошибка отправки ответа" << endl;
+                break;
             }
+            cout << "Отправлен ответ: " << response.result << endl;
         }
     }
     catch (...) {
-        std::cout << "Something went wrong!";
+        cout << "Ошибка при обработке клиента" << endl;
     }
 
     closesocket(clientSocket);
+
+    // Уменьшаем счетчик клиентов в критической секции
+    EnterCriticalSection(&cs);
+    currentClients--;
+    cout << "Клиент отключился. Текущих клиентов: " << currentClients << "/" << MAX_CLIENTS << endl;
+    LeaveCriticalSection(&cs);
 }
 
-int main() {//добавить защиту от ddos(с уменьш в крит секции)
+int main() {
     try {
         SetConsoleOutputCP(1251);
         SetConsoleCP(1251);
         setlocale(LC_ALL, "Russian");
+
+        // Инициализация критической секции
+        InitializeCriticalSection(&cs);
 
         // Инициализация Winsock
         WSADATA wsaData;
@@ -86,20 +136,22 @@ int main() {//добавить защиту от ddos(с уменьш в кри�
         if (serverSocket == INVALID_SOCKET) {
             cout << "Ошибка создания сокета" << endl;
             WSACleanup();
+            DeleteCriticalSection(&cs);
             return 1;
         }
 
         // Настройка адреса сервера
         sockaddr_in serverAddr;
         serverAddr.sin_family = AF_INET;
-        serverAddr.sin_addr.s_addr = INADDR_ANY;  // Принимаем подключения с любых адресов
-        serverAddr.sin_port = htons(8888);         // Порт 8888
+        serverAddr.sin_addr.s_addr = INADDR_ANY;
+        serverAddr.sin_port = htons(8888);
 
         // Привязка сокета к адресу
         if (bind(serverSocket, (sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
             cout << "Ошибка привязки сокета" << endl;
             closesocket(serverSocket);
             WSACleanup();
+            DeleteCriticalSection(&cs);
             return 1;
         }
 
@@ -108,10 +160,12 @@ int main() {//добавить защиту от ddos(с уменьш в кри�
             cout << "Ошибка прослушивания" << endl;
             closesocket(serverSocket);
             WSACleanup();
+            DeleteCriticalSection(&cs);
             return 1;
         }
 
-        cout << "Сервер запущен на порту 8888" << endl;
+        cout << "Сервер запущен на порту 8888 (бинарный режим)" << endl;
+        cout << "Максимальное количество клиентов: " << MAX_CLIENTS << endl;
         cout << "Ожидание подключений..." << endl;
 
         while (true) {
@@ -128,9 +182,21 @@ int main() {//добавить защиту от ddos(с уменьш в кри�
 
             // Получаем IP клиента
             char clientIP[INET_ADDRSTRLEN];
-            DWORD ipLength = INET_ADDRSTRLEN;
-            WSAAddressToStringA((sockaddr*)&clientAddr, sizeof(clientAddr), NULL, clientIP, &ipLength);
-            cout << "Новый клиент подключился: " << clientIP << endl;
+            inet_ntop(AF_INET, &clientAddr.sin_addr, clientIP, INET_ADDRSTRLEN);
+
+            // Проверка на превышение лимита подключений (защита от DDoS)
+            EnterCriticalSection(&cs);
+            if (currentClients >= MAX_CLIENTS) {
+                LeaveCriticalSection(&cs);
+                cout << "Отказ в подключении " << clientIP << ": достигнут лимит клиентов" << endl;
+                closesocket(clientSocket);
+                continue;
+            }
+
+            // Увеличиваем счетчик клиентов
+            currentClients++;
+            cout << "Новый клиент подключился: " << clientIP << " (" << currentClients << "/" << MAX_CLIENTS << ")" << endl;
+            LeaveCriticalSection(&cs);
 
             // Обрабатываем клиента в отдельном потоке
             CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)handleClient, (LPVOID)clientSocket, 0, NULL);
@@ -138,9 +204,11 @@ int main() {//добавить защиту от ddos(с уменьш в кри�
 
         closesocket(serverSocket);
         WSACleanup();
+        DeleteCriticalSection(&cs);
     }
     catch (...) {
-        std::cout << "Something went wrong!";
+        cout << "Критическая ошибка сервера!" << endl;
+        DeleteCriticalSection(&cs);
     }
 
     return 0;
